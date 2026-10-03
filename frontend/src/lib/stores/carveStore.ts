@@ -13,7 +13,7 @@ import {
   type CarveState,
   type KnifeMethod,
 } from '$lib/types/carve';
-import { designById, updateDesign } from './designStore';
+import { designById, maybePromoteRecarve, updateDesign } from './designStore';
 import { updateStone } from './stoneStore';
 
 export const carves = writable<Carve[]>([]);
@@ -72,8 +72,11 @@ export async function createCarve(draft: CarveDraft): Promise<Carve> {
 }
 
 export async function updateCarve(id: string, patch: Partial<Carve>): Promise<void> {
+  const target = get(carves).find((carve) => carve.id === id);
   await db.carves.update(id, { ...patch, updatedAt: Date.now() } as never);
   await loadCarves();
+  // 直接置为已完成时也检查再刻版切换
+  if (target && patch.state === 'done') await maybePromoteRecarve(target.designId);
 }
 
 export async function removeCarve(id: string): Promise<void> {
@@ -109,6 +112,11 @@ export async function batchUpdateCarves(ids: string[], patch: Partial<Carve>): P
     .map((carve) => ({ ...carve, ...patch, updatedAt: now }));
   await db.carves.bulkPut(rows);
   await loadCarves();
+  // 批量完成后逐稿检查再刻版切换
+  if (patch.state === 'done') {
+    const designIds = [...new Set(rows.map((row) => row.designId))];
+    for (const designId of designIds) await maybePromoteRecarve(designId);
+  }
 }
 
 /**
@@ -132,6 +140,8 @@ export async function advanceCarve(id: string): Promise<CarveState> {
       await updateStone(design.stoneId, { state: 'carved' });
     }
   }
+  // 再刻版全部完成且已登记钤印时，切换采用稿 / 印石状态 / 印谱统计
+  await maybePromoteRecarve(designId);
   return next;
 }
 

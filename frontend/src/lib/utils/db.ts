@@ -1,7 +1,8 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据结构版本号与升级迁移逻辑（v1 初版；v2 为 impressions 增加 grade 索引、
- *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段）
+ *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段；v3 为 designs 增加
+ *   换稿再刻版本链字段 recarveOf / version 并回填历史印稿）
  * - 五张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
@@ -17,7 +18,7 @@ import type { Catalog } from '$lib/types/catalog';
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -99,7 +100,7 @@ class SealCarveDatabase extends Dexie {
     });
 
     // v2：补充检索索引并回填历史记录缺失字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
         designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
@@ -129,6 +130,25 @@ class SealCarveDatabase extends Dexie {
           .modify((catalog) => {
             if (typeof catalog.orderNo !== 'number' || catalog.orderNo <= 0) catalog.orderNo = 1;
             if (!catalog.included) catalog.included = 'pending';
+          });
+      });
+
+    // v3：印稿增加换稿再刻版本链字段（recarveOf / version），回填历史印稿为首版
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, included, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<Design>('designs')
+          .toCollection()
+          .modify((design) => {
+            if (design.recarveOf === undefined) design.recarveOf = null;
+            if (typeof design.version !== 'number' || design.version < 1) design.version = 1;
           });
       });
   }
@@ -206,11 +226,12 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const designs: Design[] = [
-    { id: 'design_0101', stoneId: 'stone_01', sealText: '澄怀观道', annotation: '宗炳《画山水序》语，四字朱文', style: 'zhu', borderStyle: 'borrow', layoutNote: '四字均分，「观」字略收以让边', adopted: true, createdAt: now - day * 70, updatedAt: now - day * 40 },
-    { id: 'design_0102', stoneId: 'stone_01', sealText: '澄怀', annotation: '取前稿二字，作小印', style: 'bai', borderStyle: 'none', layoutNote: '二字上下排布，留大片红', adopted: false, createdAt: now - day * 60, updatedAt: now - day * 55 },
-    { id: 'design_0201', stoneId: 'stone_02', sealText: '日新其德', annotation: '《礼记·大学》语，白文', style: 'bai', borderStyle: 'double', layoutNote: '双边仿汉印，「德」字略长', adopted: true, createdAt: now - day * 40, updatedAt: now - day * 6 },
-    { id: 'design_0301', stoneId: 'stone_03', sealText: '金石为开', annotation: '汉谚，朱文借边', style: 'zhu', borderStyle: 'borrow', layoutNote: '借边求满，四字紧凑', adopted: true, createdAt: now - day * 120, updatedAt: now - day * 100 },
-    { id: 'design_0401', stoneId: 'stone_04', sealText: '清风徐来', annotation: '《赤壁赋》语，瓦当式', style: 'zhu', borderStyle: 'tile', layoutNote: '瓦当圆框，「来」字压缩', adopted: true, createdAt: now - day * 20, updatedAt: now - day * 2 },
+    { id: 'design_0101', stoneId: 'stone_01', sealText: '澄怀观道', annotation: '宗炳《画山水序》语，四字朱文', style: 'zhu', borderStyle: 'borrow', layoutNote: '四字均分，「观」字略收以让边', adopted: true, recarveOf: null, version: 1, createdAt: now - day * 70, updatedAt: now - day * 40 },
+    { id: 'design_0102', stoneId: 'stone_01', sealText: '澄怀', annotation: '取前稿二字，作小印', style: 'bai', borderStyle: 'none', layoutNote: '二字上下排布，留大片红', adopted: false, recarveOf: null, version: 1, createdAt: now - day * 60, updatedAt: now - day * 55 },
+    { id: 'design_0201', stoneId: 'stone_02', sealText: '日新其德', annotation: '《礼记·大学》语，白文', style: 'bai', borderStyle: 'double', layoutNote: '双边仿汉印，「德」字略长', adopted: true, recarveOf: null, version: 1, createdAt: now - day * 40, updatedAt: now - day * 6 },
+    { id: 'design_0300', stoneId: 'stone_03', sealText: '镂金琢玉', annotation: '旧稿，白文无框，已磨去', style: 'bai', borderStyle: 'none', layoutNote: '四字平排，线条偏细', adopted: false, recarveOf: null, version: 1, createdAt: now - day * 130, updatedAt: now - day * 120 },
+    { id: 'design_0301', stoneId: 'stone_03', sealText: '金石为开', annotation: '汉谚，朱文借边', style: 'zhu', borderStyle: 'borrow', layoutNote: '借边求满，四字紧凑', adopted: true, recarveOf: 'design_0300', version: 2, createdAt: now - day * 120, updatedAt: now - day * 100 },
+    { id: 'design_0401', stoneId: 'stone_04', sealText: '清风徐来', annotation: '《赤壁赋》语，瓦当式', style: 'zhu', borderStyle: 'tile', layoutNote: '瓦当圆框，「来」字压缩', adopted: true, recarveOf: null, version: 1, createdAt: now - day * 20, updatedAt: now - day * 2 },
   ];
 
   const carves: Carve[] = [
@@ -220,6 +241,8 @@ export async function seedDatabase(): Promise<void> {
     { id: 'carve_020101', designId: 'design_0201', seq: 1, knifeMethod: 'chong', minutes: 40, operator: '林砚', state: 'done', createdAt: now - day * 36, updatedAt: now - day * 34 },
     { id: 'carve_020102', designId: 'design_0201', seq: 2, knifeMethod: 'double', minutes: 25, operator: '林砚', state: 'doing', createdAt: now - day * 34, updatedAt: now - day * 3 },
     { id: 'carve_020103', designId: 'design_0201', seq: 3, knifeMethod: 'trim', minutes: 15, operator: '林砚', state: 'todo', createdAt: now - day * 34, updatedAt: now - day * 6 },
+    { id: 'carve_030001', designId: 'design_0300', seq: 1, knifeMethod: 'chong', minutes: 40, operator: '顾墨', state: 'done', createdAt: now - day * 128, updatedAt: now - day * 126 },
+    { id: 'carve_030002', designId: 'design_0300', seq: 2, knifeMethod: 'trim', minutes: 15, operator: '顾墨', state: 'done', createdAt: now - day * 126, updatedAt: now - day * 124 },
     { id: 'carve_030101', designId: 'design_0301', seq: 1, knifeMethod: 'chong', minutes: 45, operator: '顾墨', state: 'done', createdAt: now - day * 115, updatedAt: now - day * 112 },
     { id: 'carve_030102', designId: 'design_0301', seq: 2, knifeMethod: 'trim', minutes: 20, operator: '顾墨', state: 'done', createdAt: now - day * 112, updatedAt: now - day * 100 },
     { id: 'carve_040101', designId: 'design_0401', seq: 1, knifeMethod: 'qie', minutes: 30, operator: '林砚', state: 'doing', createdAt: now - day * 16, updatedAt: now - day * 2 },
@@ -229,6 +252,7 @@ export async function seedDatabase(): Promise<void> {
     { id: 'impr_010101', designId: 'design_0101', inkBrand: '西泠印泥', paperType: 'lianshi', pressure: 'medium', grade: 'excellent', stampedAt: '2026-01-20', note: '采用稿效果，朱色匀净', createdAt: now - day * 60, updatedAt: now - day * 60 },
     { id: 'impr_010102', designId: 'design_0101', inkBrand: '漳州八宝', paperType: 'xuan', pressure: 'heavy', grade: 'fair', stampedAt: '2026-01-18', note: '压力偏重，边栏糊', createdAt: now - day * 62, updatedAt: now - day * 62 },
     { id: 'impr_020101', designId: 'design_0201', inkBrand: '苏州姜思序堂', paperType: 'luowen', pressure: 'light', grade: 'good', stampedAt: '2026-03-02', note: '', createdAt: now - day * 20, updatedAt: now - day * 20 },
+    { id: 'impr_030001', designId: 'design_0300', inkBrand: '西泠印泥', paperType: 'lianshi', pressure: 'medium', grade: 'good', stampedAt: '2025-11-20', note: '旧稿钤影，石面已磨去重刻', createdAt: now - day * 125, updatedAt: now - day * 125 },
     { id: 'impr_030101', designId: 'design_0301', inkBrand: '西泠印泥', paperType: 'lianshi', pressure: 'medium', grade: 'excellent', stampedAt: '2025-12-12', note: '旧作重钤，效果稳定', createdAt: now - day * 105, updatedAt: now - day * 105 },
     { id: 'impr_030102', designId: 'design_0301', inkBrand: '自制朱磦', paperType: 'lianshi', pressure: 'light', grade: 'waste', stampedAt: '2025-12-20', note: '印泥过干，效果不佳', createdAt: now - day * 100, updatedAt: now - day * 100 },
     { id: 'impr_040101', designId: 'design_0401', inkBrand: '西泠印泥', paperType: 'xuan', pressure: 'medium', grade: 'good', stampedAt: '2026-03-08', note: '试钤一版，待修边后再钤', createdAt: now - day * 2, updatedAt: now - day * 2 },
@@ -237,8 +261,9 @@ export async function seedDatabase(): Promise<void> {
   const catalogs: Catalog[] = [
     { id: 'cata_0101', stoneId: 'stone_01', designId: 'design_0101', orderNo: 1, included: 'included', note: '印谱首方', createdAt: now - day * 50, updatedAt: now - day * 50 },
     { id: 'cata_0201', stoneId: 'stone_02', designId: 'design_0201', orderNo: 2, included: 'pending', note: '待修整完稿后收录', createdAt: now - day * 30, updatedAt: now - day * 6 },
-    { id: 'cata_0301', stoneId: 'stone_03', designId: 'design_0301', orderNo: 3, included: 'included', note: '鸡血石代表方', createdAt: now - day * 95, updatedAt: now - day * 95 },
-    { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 4, included: 'excluded', note: '此稿暂不收录，另拟新稿', createdAt: now - day * 10, updatedAt: now - day * 2 },
+    { id: 'cata_0300', stoneId: 'stone_03', designId: 'design_0300', orderNo: 3, included: 'excluded', note: '换稿再刻，由第 2 版「金石为开」接替', createdAt: now - day * 118, updatedAt: now - day * 100 },
+    { id: 'cata_0301', stoneId: 'stone_03', designId: 'design_0301', orderNo: 4, included: 'included', note: '鸡血石代表方', createdAt: now - day * 95, updatedAt: now - day * 95 },
+    { id: 'cata_0401', stoneId: 'stone_04', designId: 'design_0401', orderNo: 5, included: 'excluded', note: '此稿暂不收录，另拟新稿', createdAt: now - day * 10, updatedAt: now - day * 2 },
   ];
 
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
@@ -309,9 +334,15 @@ export async function clearAllTables(): Promise<void> {
 
 export async function importSnapshot(snapshot: SealCarveSnapshot): Promise<void> {
   await clearAllTables();
+  // 兼容 v2 及更早的备份文件：回填换稿再刻版本链字段
+  const designs = snapshot.designs.map((design) => ({
+    ...design,
+    recarveOf: design.recarveOf ?? null,
+    version: typeof design.version === 'number' && design.version >= 1 ? design.version : 1,
+  }));
   await db.transaction('rw', [db.stones, db.designs, db.carves, db.impressions, db.catalogs], async () => {
     await db.stones.bulkPut(snapshot.stones);
-    await db.designs.bulkPut(snapshot.designs);
+    await db.designs.bulkPut(designs);
     await db.carves.bulkPut(snapshot.carves);
     await db.impressions.bulkPut(snapshot.impressions);
     await db.catalogs.bulkPut(snapshot.catalogs);
@@ -371,4 +402,75 @@ export async function renumberCatalog(stoneId?: string): Promise<void> {
     a.orderNo === b.orderNo ? a.createdAt - b.createdAt : a.orderNo - b.orderNo,
   );
   await db.catalogs.bulkPut(sorted.map((row, index) => ({ ...row, orderNo: index + 1, updatedAt: Date.now() })));
+}
+
+/* ------------------------------ 换稿再刻 ------------------------------ */
+
+/**
+ * 再刻版完成并登记钤印后的印谱切换：
+ * 旧版（recarveOf 链上）未「不收录」的条目转为不收录并注明接替关系（留在印石历史里），
+ * 再为新版建立条目继承收录状态；旧版从未入谱则不新建。
+ */
+export async function switchCatalogToRecarve(design: Design): Promise<void> {
+  const ancestorIds: string[] = [];
+  let cursor = design.recarveOf;
+  while (cursor) {
+    ancestorIds.push(cursor);
+    const parent = await db.designs.get(cursor);
+    cursor = parent?.recarveOf ?? null;
+  }
+  if (ancestorIds.length === 0) return;
+  const entries = await db.catalogs.where('designId').anyOf(ancestorIds).toArray();
+  if (entries.length === 0) return;
+  const active = entries.filter((entry) => entry.included !== 'excluded');
+  const inherited = active.some((entry) => entry.included === 'included') ? 'included' : 'pending';
+  const now = Date.now();
+  await db.transaction('rw', [db.catalogs], async () => {
+    if (active.length > 0) {
+      await db.catalogs.bulkPut(
+        active.map((entry) => ({
+          ...entry,
+          included: 'excluded' as const,
+          note: `${entry.note ? `${entry.note}；` : ''}换稿再刻，由第 ${design.version} 版「${design.sealText}」接替`,
+          updatedAt: now,
+        })),
+      );
+    }
+    const maxOrder = (await db.catalogs.toArray()).reduce((max, entry) => Math.max(max, entry.orderNo), 0);
+    await db.catalogs.put({
+      id: createId('cata'),
+      stoneId: design.stoneId,
+      designId: design.id,
+      orderNo: maxOrder + 1,
+      included: inherited,
+      note: `再刻第 ${design.version} 版，接替旧稿`,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+  await renumberCatalog();
+}
+
+/* ------------------------------ 并发版本戳 ------------------------------ */
+/* 多标签页共用同一 IndexedDB：保存前比对版本戳，被其他页面改过就先重新确认 */
+
+/** 单行记录的版本戳（updatedAt）；记录不存在返回 null */
+export async function rowUpdatedAt(table: 'designs' | 'impressions', id: string): Promise<number | null> {
+  const row = await db.table(table).get(id);
+  return row ? (row.updatedAt as number) : null;
+}
+
+/** 某印稿钤印记录的集合版本戳（条数 + 最新更新时间），用于识别其他标签页补钤印 */
+export async function impressionVersionStamp(designId: string): Promise<string> {
+  const rows = await db.impressions.where('designId').equals(designId).toArray();
+  const max = rows.reduce((acc, row) => Math.max(acc, row.updatedAt), 0);
+  return `${rows.length}:${max}`;
+}
+
+/** 是否已存在该稿的再刻版（防止两个标签页对同一采用稿重复建版） */
+export async function hasRecarveChild(designId: string): Promise<boolean> {
+  const row = await db.designs.get(designId);
+  if (!row) return false;
+  const siblings = await db.designs.where('stoneId').equals(row.stoneId).toArray();
+  return siblings.some((item) => item.recarveOf === designId);
 }

@@ -68,7 +68,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | 路由（hash 形式） | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
 | `/#/stones` | 印石台账 | 新建印石、按石种与钮式筛选（同步 URL query），显示已刻方数、谱录方数与闲置天数 | Stone、Design |
-| `/#/designs` | 印稿设计与释文 | 朱文白文、边框式样与章法备注录入，标记采用稿（同石采用稿唯一） | Design、Stone |
+| `/#/designs` | 印稿设计与释文 | 朱文白文、边框式样与章法备注录入，标记采用稿（同石采用稿唯一），换稿再刻建独立版本 | Design、Stone |
 | `/#/carve` | 刻制工序看板 | 按印稿列出刀法步骤、拖拽或上下移排序、批量完成；全部完成回写印石为「已刻」 | Carve、Design |
 | `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果 | Impression、Design |
 | `/#/catalog` | 印谱汇总与导出 | 排序重编号、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
@@ -82,12 +82,18 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Stone 印石 | `src/lib/types/stone.ts` | `id` `name` `stoneType`（寿山/青田/昌化/巴林） `sizeMm`（长×宽×高） `knobStyle`（平顶/桥钮/古兽/薄意） `purchaseDate` `state`（在刻/已刻/闲置） | 新建后进入印稿设计，卡片回显已刻方数与最近钤印日期 |
-| Design 印稿 | `src/lib/types/design.ts` | `id` `stoneId` `sealText` `annotation` `style`（朱文/白文） `borderStyle`（无框/双边/借边/瓦当） `layoutNote` `adopted` | 同石多稿，采用稿唯一，采用后带出到刻制与钤印 |
+| Design 印稿 | `src/lib/types/design.ts` | `id` `stoneId` `sealText` `annotation` `style`（朱文/白文） `borderStyle`（无框/双边/借边/瓦当） `layoutNote` `adopted` `recarveOf` `version` | 同石多稿，采用稿唯一，采用后带出到刻制与钤印；换稿再刻时建独立再刻版并串成版本链 |
 | Carve 刻制工序 | `src/lib/types/carve.ts` | `id` `designId` `seq` `knifeMethod`（冲刀/切刀/双刀/修整） `minutes` `operator` `state`（未开始/进行中/已完成） | 拖拽调序，全部完成即回写印石为已刻 |
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
 | Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
+数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v3`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）；`v3` 为 `designs` 增加换稿再刻版本链字段 `recarveOf`（再刻来源印稿）与 `version`（版本序号），历史印稿回填为首版（`recarveOf: null`、`version: 1`），导入 v2 及更早的 JSON 备份时同样自动回填。
+
+### 换稿再刻与并发确认
+
+- **换稿再刻**：采用稿（或已有工序 / 钤印的稿）的印文、朱白文或边框变更时，保存会建立独立再刻版而不是直接改旧稿——新稿 `recarveOf` 指向上一版、`version` 递增、初始不采用；旧稿、工序、钤印与印谱条目原样留在印石历史里（卡片标「历史旧版」）；旧工序按原序复制为「未开始」待办，**不继承旧钤印**。
+- **完成切换**：再刻版工序全部完成且已登记钤印时，才把采用稿、印石状态（已刻）、最佳效果（印石卡片只取当前采用稿的最佳评级）与印谱统计切到它——旧版未「不收录」的谱录条目转为不收录并注明接替关系，新版建立条目继承收录状态。
+- **并发确认**：多个标签页共用同一 IndexedDB。印稿保存、再刻建版与钤印登记前会比对版本戳（`updatedAt` / 钤印集合戳），若另一标签页已修改采用稿或补了钤印，会先弹出「保存前请重新确认」，确认后才写入。
 
 ---
 

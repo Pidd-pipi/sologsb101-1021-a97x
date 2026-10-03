@@ -25,7 +25,7 @@
     reorderCarves,
     updateCarve,
   } from '$lib/stores/carveStore';
-  import { currentDesignId, designs, setCurrentDesign } from '$lib/stores/designStore';
+  import { clearRecarveNotice, currentDesignId, designs, recarveNotice, setCurrentDesign } from '$lib/stores/designStore';
   import { stones } from '$lib/stores/stoneStore';
   import {
     CARVE_STATE_COLOR,
@@ -86,6 +86,16 @@
   let pendingDelete = $state<Carve | null>(null);
   let selectedIds = $state<string[]>([]);
   let dragId = $state('');
+  let toast = $state('');
+
+  // 再刻版工序全部完成且已登记钤印时，采用稿 / 印石状态 / 印谱统计切换到再刻版
+  $effect(() => {
+    const notice = $recarveNotice;
+    if (!notice) return;
+    toast = `再刻第 ${notice.version} 版「${notice.sealText}」已完成并登记钤印：采用稿、印石状态与印谱统计已切换`;
+    clearRecarveNotice();
+    setTimeout(() => (toast = ''), 3600);
+  });
 
   function openCreate(): void {
     if (!activeDesignId) return;
@@ -188,12 +198,19 @@
     </div>
   </div>
 
+  {#if toast}
+    <div class="rounded-xl border border-jade/40 bg-jade/10 px-4 py-2 text-sm text-jade">{toast}</div>
+  {/if}
+
   {#if activeDesign}
     <div class="gb-panel flex flex-wrap items-center gap-3 text-sm text-ink-soft">
       <span class="text-ink">印文：{activeDesign.sealText}</span>
       <span>印石：{stoneName}</span>
       <span>{DESIGN_STYLE_LABEL[activeDesign.style]}</span>
       <span>释文：{activeDesign.annotation || '未填写'}</span>
+      {#if activeDesign.recarveOf && !activeDesign.adopted}
+        <span class="gb-tag" style="color:#b98a3c;border-color:#b98a3c66">再刻第 {activeDesign.version} 版 · 待完工</span>
+      {/if}
     </div>
   {/if}
 
@@ -269,6 +286,7 @@
 
   <p class="text-xs text-ink-soft">
     状态推进顺序：未开始 → 进行中 → 已完成；某印稿全部工序完成时，会把所属印石状态回写为「已刻」。
+    再刻版全部完成且已登记钤印时，采用稿、印石状态与印谱统计才切换到再刻版。
   </p>
 </div>
 

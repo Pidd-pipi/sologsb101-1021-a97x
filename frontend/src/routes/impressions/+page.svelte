@@ -2,6 +2,7 @@
   /**
    * /impressions 钤印登记与效果比对
    * 同稿多枚并列展示印泥、纸张、压力与评级并择优，可一键回填为采用稿效果。
+   * 保存前比对版本戳：其他标签页修改采用稿或补钤印时，先重新确认再写。
    * 消费 Impression、Design；复用 <GradeTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
    */
   import { push, router } from '$lib/router';
@@ -28,7 +29,8 @@
     setImpressionPaperTypes,
     updateImpression,
   } from '$lib/stores/impressionStore';
-  import { currentDesignId, designs, setCurrentDesign } from '$lib/stores/designStore';
+  import { clearRecarveNotice, currentDesignId, designs, recarveNotice, setCurrentDesign } from '$lib/stores/designStore';
+  import { impressionVersionStamp, rowUpdatedAt } from '$lib/utils/db';
   import {
     GRADE_COLOR,
     GRADE_LABEL,
@@ -86,11 +88,28 @@
   let draft = $state<ImpressionDraft>(createEmptyImpressionDraft(''));
   let pendingDelete = $state<Impression | null>(null);
   let toast = $state('');
+  /** 打开对话框时记录的版本戳：采用稿 updatedAt、该稿钤印集合戳、被编辑记录 updatedAt */
+  let baseDesignStamp = $state<number | null>(null);
+  let baseImpressionStamp = $state('');
+  let baseRowStamp = $state<number | null>(null);
+  /** 保存前重新确认：proceed 为 null 表示仅提示不可继续（如记录已被删除） */
+  let staleConfirm = $state<{ text: string; proceed: (() => Promise<void>) | null } | null>(null);
 
-  function openCreate(): void {
+  // 再刻版完成并登记钤印后，采用稿 / 印石状态 / 印谱统计已切换的提示
+  $effect(() => {
+    const notice = $recarveNotice;
+    if (!notice) return;
+    toast = `再刻第 ${notice.version} 版「${notice.sealText}」已完成并登记钤印：采用稿、印石状态与印谱统计已切换`;
+    clearRecarveNotice();
+    setTimeout(() => (toast = ''), 3600);
+  });
+
+  async function openCreate(): Promise<void> {
     if (!activeDesignId) return;
     editing = null;
     draft = createEmptyImpressionDraft(activeDesignId);
+    baseDesignStamp = activeDesign?.updatedAt ?? null;
+    baseImpressionStamp = await impressionVersionStamp(activeDesignId);
     dialogOpen = true;
   }
 
@@ -105,10 +124,42 @@
       stampedAt: impression.stampedAt,
       note: impression.note,
     };
+    baseRowStamp = impression.updatedAt;
     dialogOpen = true;
   }
 
   async function submit(): Promise<void> {
+    const stale = await checkStaleBeforeSave();
+    if (stale) {
+      staleConfirm = stale;
+      return;
+    }
+    await doSubmit();
+  }
+
+  /** 保存前重新确认：其他标签页修改采用稿或补钤印时，旧页面版本失效 */
+  async function checkStaleBeforeSave(): Promise<{ text: string; proceed: (() => Promise<void>) | null } | null> {
+    if (editing) {
+      const fresh = await rowUpdatedAt('impressions', editing.id);
+      if (fresh === null) return { text: '该钤印记录已在其他页面被删除。', proceed: null };
+      if (baseRowStamp !== null && fresh !== baseRowStamp) {
+        return { text: '该钤印记录已在其他页面被修改，保存将覆盖那些更改。是否继续？', proceed: doSubmit };
+      }
+      return null;
+    }
+    const designFresh = await rowUpdatedAt('designs', draft.designId);
+    if (designFresh === null) return { text: '该印稿已在其他页面被删除，无法登记钤印。', proceed: null };
+    const impressionFresh = await impressionVersionStamp(draft.designId);
+    if ((baseDesignStamp !== null && designFresh !== baseDesignStamp) || impressionFresh !== baseImpressionStamp) {
+      return {
+        text: '该采用稿或其钤印记录已在其他页面变更（可能另一标签页改了采用稿或补了钤印）。确认继续登记？',
+        proceed: doSubmit,
+      };
+    }
+    return null;
+  }
+
+  async function doSubmit(): Promise<void> {
     if (editing) {
       await updateImpression(editing.id, { ...draft });
       editing = null;
@@ -116,6 +167,13 @@
       await createImpression({ ...draft });
     }
     dialogOpen = false;
+    staleConfirm = null;
+  }
+
+  async function confirmStale(): Promise<void> {
+    const proceed = staleConfirm?.proceed;
+    staleConfirm = null;
+    if (proceed) await proceed();
   }
 
   async function confirmDelete(): Promise<void> {
@@ -150,7 +208,7 @@
         {/each}
       </select>
       <button class="gb-btn" disabled={list.length === 0} onclick={() => void adoptBest()}>回填采用稿效果</button>
-      <button class="gb-btn-primary" onclick={openCreate}>登记钤印</button>
+      <button class="gb-btn-primary" onclick={() => void openCreate()}>登记钤印</button>
     </div>
   </div>
 
@@ -199,7 +257,7 @@
       title="该印稿还没有钤印记录"
       description="登记第一次钤印：填写印泥品牌、纸张、压力与效果评级；同稿多次钤印会自动按评级排序。"
       actionText="登记钤印"
-      onAction={openCreate}
+      onAction={() => void openCreate()}
     />
   {:else}
     <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -234,6 +292,8 @@
 
   <p class="text-xs text-ink-soft">
     评级排序：优 &gt; 良 &gt; 一般 &gt; 废；「回填采用稿效果」会把当前稿评级最高的一条标记为采用效果，并把印稿置为采用稿。
+    再刻版工序全部完成后，首次登记钤印会把采用稿、印石状态与印谱统计切换到再刻版；
+    若另一标签页改了采用稿或补了钤印，保存前会先提示重新确认。
   </p>
 </div>
 
@@ -291,6 +351,23 @@
       <div class="mt-5 flex justify-end gap-2">
         <button class="gb-btn" onclick={() => (dialogOpen = false)}>取消</button>
         <button class="gb-btn-primary" onclick={() => void submit()}>保存</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if staleConfirm}
+  <div class="fixed inset-0 z-[60] grid place-items-center bg-black/40 px-4">
+    <div class="w-full max-w-md rounded-xl border border-line bg-paper-light p-5 shadow-xl">
+      <h3 class="text-lg text-ink">保存前请重新确认</h3>
+      <p class="mt-2 text-sm text-ink-soft">{staleConfirm.text}</p>
+      <div class="mt-5 flex justify-end gap-2">
+        {#if staleConfirm.proceed}
+          <button class="gb-btn" onclick={() => (staleConfirm = null)}>取消</button>
+          <button class="gb-btn-primary" onclick={() => void confirmStale()}>确认并保存</button>
+        {:else}
+          <button class="gb-btn-primary" onclick={() => (staleConfirm = null)}>知道了</button>
+        {/if}
       </div>
     </div>
   </div>

@@ -2,6 +2,8 @@
   /**
    * /designs 印稿设计与释文编辑
    * 朱文白文、边框式样与章法备注录入并标记采用稿（同石采用稿唯一）。
+   * 换稿再刻：采用稿（或已有工序/钤印的稿）变更印文 / 朱白文 / 边框时建独立再刻版，
+   * 旧稿与工序、钤印、印谱留在印石历史里；保存前比对版本戳，其他标签页改过就先重新确认。
    * 消费 Design、Stone；复用 <FilterBar>、<EmptyPanel>、<GradeTag>、<StatBadge>。
    */
   import { push, router } from '$lib/router';
@@ -18,6 +20,7 @@
   import {
     adoptDesign,
     createDesign,
+    createRecarveVersion,
     currentDesignId,
     designFilters,
     designs,
@@ -32,8 +35,10 @@
     setDesignStyles,
     updateDesign,
   } from '$lib/stores/designStore';
+  import { loadCarves } from '$lib/stores/carveStore';
   import { currentStoneId, setCurrentStone, stones } from '$lib/stores/stoneStore';
   import { impressions, bestImpressionOf } from '$lib/stores/impressionStore';
+  import { hasRecarveChild, rowUpdatedAt } from '$lib/utils/db';
   import {
     BORDER_STYLE_LABEL,
     BORDER_STYLE_OPTIONS,
@@ -86,21 +91,24 @@
     stamped: $impressions.length,
   });
 
+  /** 已被再刻版接替的旧稿 id 集合（历史旧版徽标） */
+  const supersededIds = $derived(
+    new Set($designs.map((design) => design.recarveOf).filter((id): id is string => id !== null)),
+  );
+
+  type DialogMode = 'create' | 'edit' | 'recarve';
+
   let dialogOpen = $state(false);
+  let dialogMode = $state<DialogMode>('create');
   let editing = $state<Design | null>(null);
   let draft = $state<DesignDraft>(createEmptyDesignDraft(''));
   let pendingDelete = $state<Design | null>(null);
+  /** 打开对话框时记录的印稿版本戳（保存前比对，识别其他标签页的并发修改） */
+  let baseStamp = $state<number | null>(null);
+  /** 保存前重新确认：proceed 为 null 表示仅提示不可继续（如记录已被删除） */
+  let staleConfirm = $state<{ text: string; proceed: (() => Promise<void>) | null } | null>(null);
 
-  function openCreate(): void {
-    const stoneId = activeStoneId;
-    if (!stoneId) return;
-    editing = null;
-    draft = createEmptyDesignDraft(stoneId);
-    dialogOpen = true;
-  }
-
-  function openEdit(design: Design): void {
-    editing = design;
+  function prefillFrom(design: Design): void {
     draft = {
       stoneId: design.stoneId,
       sealText: design.sealText,
@@ -109,19 +117,110 @@
       borderStyle: design.borderStyle,
       layoutNote: design.layoutNote,
       adopted: design.adopted,
+      recarveOf: design.recarveOf,
+      version: design.version,
     };
+  }
+
+  function openCreate(): void {
+    const stoneId = activeStoneId;
+    if (!stoneId) return;
+    dialogMode = 'create';
+    editing = null;
+    baseStamp = null;
+    draft = createEmptyDesignDraft(stoneId);
     dialogOpen = true;
   }
+
+  function openEdit(design: Design): void {
+    dialogMode = 'edit';
+    editing = design;
+    baseStamp = design.updatedAt;
+    prefillFrom(design);
+    dialogOpen = true;
+  }
+
+  /** 换稿再刻：以当前采用稿为上一版，预填内容，保存时建独立再刻版 */
+  function openRecarve(design: Design): void {
+    dialogMode = 'recarve';
+    editing = design;
+    baseStamp = design.updatedAt;
+    prefillFrom(design);
+    dialogOpen = true;
+  }
+
+  /** 印文 / 朱白文 / 边框是否被改动（换稿再刻的触发条件） */
+  const keyChanged = $derived(
+    editing !== null &&
+      (draft.sealText !== editing.sealText ||
+        draft.style !== editing.style ||
+        draft.borderStyle !== editing.borderStyle),
+  );
+  const editingProgress = $derived(editing ? progressOfDesign($progressByDesign, editing.id) : null);
+  const editingHasHistory = $derived(
+    (editingProgress?.total ?? 0) > 0 || (editingProgress?.impressionCount ?? 0) > 0,
+  );
+  /** 本次保存是否走再刻版流程：显式换稿再刻，或编辑采用稿 / 有历史的稿时改了关键字段 */
+  const recarveFlow = $derived(
+    editing !== null &&
+      (dialogMode === 'recarve' || (dialogMode === 'edit' && keyChanged && (editing.adopted || editingHasHistory))),
+  );
 
   async function submit(): Promise<void> {
     if (draft.sealText.trim().length === 0) return;
     if (editing) {
+      const stale = await checkStaleBeforeSave();
+      if (stale) {
+        staleConfirm = stale;
+        return;
+      }
+    }
+    await doSubmit();
+  }
+
+  /** 保存前重新确认：其他标签页修改采用稿或建过再刻版时，旧页面版本失效 */
+  async function checkStaleBeforeSave(): Promise<{ text: string; proceed: (() => Promise<void>) | null } | null> {
+    if (!editing) return null;
+    const fresh = await rowUpdatedAt('designs', editing.id);
+    if (fresh === null) {
+      return { text: '该印稿已在其他页面被删除，请关闭对话框后刷新列表。', proceed: null };
+    }
+    const changedElsewhere = baseStamp !== null && fresh !== baseStamp;
+    if (recarveFlow) {
+      if (await hasRecarveChild(editing.id)) {
+        return { text: '该印稿已存在再刻版（可能另一标签页已建版），仍要再建一版吗？', proceed: doSubmit };
+      }
+      if (changedElsewhere) {
+        return { text: '该采用稿已在其他页面被修改，再刻版将按最新工序复制为待办。是否继续？', proceed: doSubmit };
+      }
+    } else if (changedElsewhere) {
+      return { text: '该印稿已在其他页面被修改，继续保存将覆盖那些更改。是否继续？', proceed: doSubmit };
+    }
+    return null;
+  }
+
+  async function doSubmit(): Promise<void> {
+    if (recarveFlow && editing) {
+      const created = await createRecarveVersion(editing.id, { ...draft });
+      if (!created) {
+        staleConfirm = { text: '该印稿已在其他页面被删除，无法建立再刻版。', proceed: null };
+        return;
+      }
+      await loadCarves();
+    } else if (dialogMode !== 'create' && editing) {
       await updateDesign(editing.id, { ...draft });
-      editing = null;
     } else {
       await createDesign({ ...draft });
     }
     dialogOpen = false;
+    editing = null;
+    staleConfirm = null;
+  }
+
+  async function confirmStale(): Promise<void> {
+    const proceed = staleConfirm?.proceed;
+    staleConfirm = null;
+    if (proceed) await proceed();
   }
 
   async function confirmDelete(): Promise<void> {
@@ -213,7 +312,16 @@
             <div class="flex flex-wrap items-center gap-2">
               <span class="gb-tag" style="color:#9c2b1f;border-color:#9c2b1f66">{DESIGN_STYLE_LABEL[design.style]}</span>
               <span class="text-lg font-semibold tracking-[0.2em] text-ink">{design.sealText}</span>
+              {#if design.version > 1}
+                <span class="gb-tag" style="color:#4c5254;border-color:#4c525466">第 {design.version} 版</span>
+              {/if}
               {#if design.adopted}<span class="gb-tag" style="color:#3f6b57;border-color:#3f6b5766">采用稿</span>{/if}
+              {#if design.recarveOf && !design.adopted}
+                <span class="gb-tag" style="color:#b98a3c;border-color:#b98a3c66">再刻中</span>
+              {/if}
+              {#if supersededIds.has(design.id)}
+                <span class="gb-tag" style="color:#8b8f90;border-color:#8b8f9066">历史旧版</span>
+              {/if}
             </div>
             <span class="text-xs text-ink-soft">{BORDER_STYLE_LABEL[design.borderStyle]}</span>
           </header>
@@ -246,6 +354,9 @@
             {#if !design.adopted}
               <button class="gb-btn" onclick={() => void adoptDesign(design.id)}>设为采用稿</button>
             {/if}
+            {#if design.adopted}
+              <button class="gb-btn" onclick={() => openRecarve(design)}>换稿再刻</button>
+            {/if}
             <button class="gb-btn" onclick={() => (setCurrentDesign(design.id), void push('/carve'))}>排工序</button>
             <button class="gb-btn" onclick={() => (setCurrentDesign(design.id), void push('/impressions'))}>去钤印</button>
             <button class="gb-btn" onclick={() => openEdit(design)}>编辑</button>
@@ -258,17 +369,32 @@
 
   <p class="text-xs text-ink-soft">
     采用稿唯一：把某一稿设为采用稿时，同印石的其它稿会自动取消采用标记；采用稿与工序完成后才计入「已刻方数」。
+    换稿再刻：采用稿的印文、朱白文或边框变更时保存会建独立再刻版（复制旧工序为待办、不继承旧钤印），
+    旧稿与工序、钤印、印谱留在印石历史里；再刻版完成并登记钤印后，采用稿、印石状态与印谱统计才切换到它。
   </p>
 </div>
 
 {#if dialogOpen}
   <div class="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4">
     <div class="w-full max-w-lg rounded-xl border border-line bg-paper-light p-5 shadow-xl">
-      <h3 class="mb-3 text-lg text-ink">{editing ? `编辑印稿「${editing.sealText}」` : '新建印稿'}</h3>
+      <h3 class="mb-3 text-lg text-ink">
+        {dialogMode === 'recarve'
+          ? `换稿再刻 · 第 ${(editing?.version ?? 1) + 1} 版`
+          : editing
+            ? `编辑印稿「${editing.sealText}」`
+            : '新建印稿'}
+      </h3>
       <div class="space-y-3">
+        {#if recarveFlow}
+          <div class="rounded-xl border border-amber/50 bg-amber/10 px-3 py-2 text-xs leading-relaxed text-ink-soft">
+            将建立独立再刻版（第 {(editing?.version ?? 1) + 1} 版）：复制当前稿 {editingProgress?.total ?? 0}
+            道工序为待办，不继承旧钤印；旧稿、工序、钤印与印谱保留在印石历史中。
+            新版完成并登记钤印后，采用稿、印石状态与印谱统计才切换到它。
+          </div>
+        {/if}
         <label class="block">
           <span class="gb-label">所属印石</span>
-          <select class="gb-input" bind:value={draft.stoneId}>
+          <select class="gb-input" bind:value={draft.stoneId} disabled={recarveFlow}>
             {#each $stones as stone (stone.id)}
               <option value={stone.id}>{STONE_TYPE_LABEL[stone.stoneType]} · {stone.name}</option>
             {/each}
@@ -301,19 +427,43 @@
               {/each}
             </select>
           </label>
-          <label class="flex items-center gap-2 pt-5">
-            <input type="checkbox" bind:checked={draft.adopted} />
-            <span class="text-sm text-ink">标记为采用稿</span>
-          </label>
+          {#if !recarveFlow}
+            <label class="flex items-center gap-2 pt-5">
+              <input type="checkbox" bind:checked={draft.adopted} />
+              <span class="text-sm text-ink">标记为采用稿</span>
+            </label>
+          {/if}
         </div>
         <label class="block">
           <span class="gb-label">章法备注</span>
           <textarea class="gb-input" rows="2" bind:value={draft.layoutNote} placeholder="如：四字均分，「观」字略收以让边"></textarea>
         </label>
+        {#if dialogMode === 'edit' && !recarveFlow && editing?.adopted}
+          <p class="text-xs text-ink-soft">
+            提示：这是采用稿，修改印文、朱白文或边框后保存将自动改为建立独立再刻版，旧稿与钤印保留为历史。
+          </p>
+        {/if}
       </div>
       <div class="mt-5 flex justify-end gap-2">
         <button class="gb-btn" onclick={() => (dialogOpen = false)}>取消</button>
-        <button class="gb-btn-primary" onclick={() => void submit()}>保存</button>
+        <button class="gb-btn-primary" onclick={() => void submit()}>{recarveFlow ? '建立再刻版' : '保存'}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if staleConfirm}
+  <div class="fixed inset-0 z-[60] grid place-items-center bg-black/40 px-4">
+    <div class="w-full max-w-md rounded-xl border border-line bg-paper-light p-5 shadow-xl">
+      <h3 class="text-lg text-ink">保存前请重新确认</h3>
+      <p class="mt-2 text-sm text-ink-soft">{staleConfirm.text}</p>
+      <div class="mt-5 flex justify-end gap-2">
+        {#if staleConfirm.proceed}
+          <button class="gb-btn" onclick={() => (staleConfirm = null)}>取消</button>
+          <button class="gb-btn-primary" onclick={() => void confirmStale()}>确认并保存</button>
+        {:else}
+          <button class="gb-btn-primary" onclick={() => (staleConfirm = null)}>知道了</button>
+        {/if}
       </div>
     </div>
   </div>

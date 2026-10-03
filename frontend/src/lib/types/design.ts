@@ -25,6 +25,10 @@ export interface Design {
   layoutNote: string;
   /** 是否采用稿 */
   adopted: boolean;
+  /** 再刻来源印稿 id（首版为 null）；换稿再刻时指向上一版，旧稿留在印石历史里 */
+  recarveOf: string | null;
+  /** 版本序号：同一印石上的第几版（首版 1，换稿再刻递增） */
+  version: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -69,6 +73,8 @@ export function createEmptyDesignDraft(stoneId: string): DesignDraft {
     borderStyle: 'borrow',
     layoutNote: '',
     adopted: false,
+    recarveOf: null,
+    version: 1,
   };
 }
 

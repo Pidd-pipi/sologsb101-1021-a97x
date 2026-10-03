@@ -85,7 +85,7 @@ export function buildCatalogText(context: SealCatalogContext): string {
     const best = [...prints].sort((a, b) => gradeWeight(b.grade) - gradeWeight(a.grade))[0];
     lines.push(`第 ${catalog.orderNo} 方　${INCLUDED_LABEL[catalog.included]}`);
     lines.push(
-      `　印文：${design?.sealText ?? '（印稿已删除）'}　释文：${design?.annotation ?? '无'}`,
+      `　印文：${design?.sealText ?? '（印稿已删除）'}${design && design.version > 1 ? `（再刻第 ${design.version} 版）` : ''}　释文：${design?.annotation ?? '无'}`,
     );
     lines.push(
       `　形制：${design ? `${DESIGN_STYLE_LABEL[design.style]}·${BORDER_STYLE_LABEL[design.borderStyle]}` : '未知'}　章法：${design?.layoutNote || '无'}`,

@@ -142,10 +142,12 @@
     await updateStone(stone.id, { state: next });
   }
 
+  // 最佳效果只跟随当前采用稿：再刻版完成并登记钤印、采用稿切换后，最佳效果才取自新稿；
+  // 旧版钤印仍留在印石历史（印稿页 / 钤印页可查），不计入当前最佳
   function bestGradeOf(stoneId: string): Grade | null {
-    const stoneDesigns = designsOfStone(stoneId);
-    const designIds = stoneDesigns.map((design) => design.id);
-    const prints = $impressions.filter((impression) => designIds.includes(impression.designId));
+    const adopted = designsOfStone(stoneId).find((design) => design.adopted);
+    if (!adopted) return null;
+    const prints = $impressions.filter((impression) => impression.designId === adopted.id);
     if (prints.length === 0) return null;
     return [...prints].sort((a, b) => GRADE_WEIGHT[b.grade] - GRADE_WEIGHT[a.grade])[0]?.grade ?? null;
   }

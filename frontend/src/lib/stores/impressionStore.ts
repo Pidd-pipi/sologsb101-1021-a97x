@@ -11,7 +11,7 @@ import {
   type ImpressionDraft,
   type PaperKind,
 } from '$lib/types/impression';
-import { adoptDesign, designById, updateDesign } from './designStore';
+import { adoptDesign, designById, maybePromoteRecarve, updateDesign } from './designStore';
 
 export interface ImpressionFilters {
   keyword: string;
@@ -103,6 +103,8 @@ export async function createImpression(draft: ImpressionDraft): Promise<Impressi
   const row: Impression = { ...draft, id: createId('impr'), createdAt: now, updatedAt: now };
   await db.impressions.put(row);
   await loadImpressions();
+  // 再刻版已完工、本次为首次登记钤印时，切换采用稿 / 印石状态 / 印谱统计
+  await maybePromoteRecarve(row.designId);
   return row;
 }
 
