@@ -1,9 +1,11 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据结构版本号与升级迁移逻辑（v1 初版；v2 为 impressions 增加 grade 索引、
- *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段）
+ *   为 catalogs 增加 orderNo 索引，并回填历史记录缺失字段；v3 引入换稿再刻版本链
+ *   design.revision / sourceDesignId / supersededByDesignId / certifiedAt）
  * - 五张业务表的增删改查与整库导入导出
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
+ * - CRUD 钩子广播跨标签页变更；StaleVersionError 支撑「保存前重新确认」
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
 import Dexie, { type Table } from 'dexie';
@@ -12,12 +14,27 @@ import type { Design } from '$lib/types/design';
 import type { Carve } from '$lib/types/carve';
 import type { Impression } from '$lib/types/impression';
 import type { Catalog } from '$lib/types/catalog';
+import { broadcastCrudChange, CRUD_TABLE_NAMES, type CrudTableName } from './crud-events';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbsealcarve';
 
 /** 当前数据结构版本号 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
+
+/**
+ * 乐观并发冲突：页面持有的记录版本（updatedAt）已过期
+ * （另一标签页同时改了采用稿或补了钤印）。调用方应重新载入并请用户确认后再写。
+ */
+export class StaleVersionError extends Error {
+  constructor(
+    public table: string,
+    public id: string,
+  ) {
+    super(`页面记录已过期（${table}/${id} 已在别处被修改），请重新确认后再保存`);
+    this.name = 'StaleVersionError';
+  }
+}
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -99,7 +116,7 @@ class SealCarveDatabase extends Dexie {
     });
 
     // v2：补充检索索引并回填历史记录缺失字段
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
         designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
@@ -131,6 +148,44 @@ class SealCarveDatabase extends Dexie {
             if (!catalog.included) catalog.included = 'pending';
           });
       });
+
+    // v3：换稿再刻版本链（索引不变，仅回填版本字段，历史记录一律视为已认证初版）
+    this.version(DB_VERSION)
+      .stores({
+        stones: 'id, name, stoneType, knobStyle, state, purchaseDate, updatedAt',
+        designs: 'id, stoneId, style, borderStyle, adopted, updatedAt',
+        carves: 'id, designId, seq, knifeMethod, operator, state, updatedAt',
+        impressions: 'id, designId, grade, paperType, stampedAt, updatedAt',
+        catalogs: 'id, stoneId, designId, orderNo, included, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<Design>('designs')
+          .toCollection()
+          .modify((design) => {
+            if (typeof design.revision !== 'number' || design.revision <= 0) design.revision = 1;
+            if (design.sourceDesignId === undefined) design.sourceDesignId = null;
+            if (design.supersededByDesignId === undefined) design.supersededByDesignId = null;
+            // 历史已采用稿视为已完成认证，保证升级前后「已刻方数」等统计一致
+            if (design.certifiedAt === undefined) design.certifiedAt = design.adopted ? design.updatedAt : null;
+          });
+      });
+
+    this.registerCrudHooks();
+  }
+
+  /** 任意写入都广播给其它标签页，使其页面旧版本失效并重新载入 */
+  private registerCrudHooks(): void {
+    CRUD_TABLE_NAMES.forEach((tableName) => {
+      const table = this.table(tableName);
+      const notify = (): void => {
+        // 广播只走 BroadcastChannel / localStorage，不读写数据库，可安全从事务中发出
+        queueMicrotask(() => broadcastCrudChange(tableName as CrudTableName));
+      };
+      table.hook('creating', notify);
+      table.hook('updating', notify);
+      table.hook('deleting', notify);
+    });
   }
 }
 
@@ -140,6 +195,28 @@ export const db = new SealCarveDatabase();
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}${rand}`;
+}
+
+/**
+ * 保存前重新确认（乐观并发）：仅当记录的 updatedAt 与页面持有的 expectedUpdatedAt
+ * 一致时才写入；另一标签页若已改过该行，则抛 StaleVersionError，由页面提示重新确认。
+ * expectedUpdatedAt 省略时退化为普通更新。
+ */
+export async function updateIfCurrent<T extends { id: string; updatedAt?: number }>(
+  table: Table<T, string>,
+  id: string,
+  patch: Partial<T>,
+  expectedUpdatedAt?: number,
+): Promise<void> {
+  await db.transaction('rw', table, async () => {
+    if (expectedUpdatedAt !== undefined) {
+      const current = await table.get(id);
+      if (!current || current.updatedAt !== expectedUpdatedAt) {
+        throw new StaleVersionError(table.name, id);
+      }
+    }
+    await table.update(id, { ...patch, updatedAt: Date.now() } as never);
+  });
 }
 
 /** 打开数据库并在首次使用时播种演示数据（幂等） */
@@ -203,14 +280,29 @@ export async function seedDatabase(): Promise<void> {
       createdAt: now - day * 30,
       updatedAt: now - day,
     },
+    {
+      id: 'stone_05',
+      name: '青田灯光冻方章',
+      stoneType: 'qingtian',
+      sizeMm: '24×24×66',
+      knobStyle: 'flat',
+      purchaseDate: '2025-09-12',
+      state: 'carving',
+      createdAt: now - day * 120,
+      updatedAt: now - day * 2,
+    },
   ];
 
   const designs: Design[] = [
-    { id: 'design_0101', stoneId: 'stone_01', sealText: '澄怀观道', annotation: '宗炳《画山水序》语，四字朱文', style: 'zhu', borderStyle: 'borrow', layoutNote: '四字均分，「观」字略收以让边', adopted: true, createdAt: now - day * 70, updatedAt: now - day * 40 },
-    { id: 'design_0102', stoneId: 'stone_01', sealText: '澄怀', annotation: '取前稿二字，作小印', style: 'bai', borderStyle: 'none', layoutNote: '二字上下排布，留大片红', adopted: false, createdAt: now - day * 60, updatedAt: now - day * 55 },
-    { id: 'design_0201', stoneId: 'stone_02', sealText: '日新其德', annotation: '《礼记·大学》语，白文', style: 'bai', borderStyle: 'double', layoutNote: '双边仿汉印，「德」字略长', adopted: true, createdAt: now - day * 40, updatedAt: now - day * 6 },
-    { id: 'design_0301', stoneId: 'stone_03', sealText: '金石为开', annotation: '汉谚，朱文借边', style: 'zhu', borderStyle: 'borrow', layoutNote: '借边求满，四字紧凑', adopted: true, createdAt: now - day * 120, updatedAt: now - day * 100 },
-    { id: 'design_0401', stoneId: 'stone_04', sealText: '清风徐来', annotation: '《赤壁赋》语，瓦当式', style: 'zhu', borderStyle: 'tile', layoutNote: '瓦当圆框，「来」字压缩', adopted: true, createdAt: now - day * 20, updatedAt: now - day * 2 },
+    { id: 'design_0101', stoneId: 'stone_01', sealText: '澄怀观道', annotation: '宗炳《画山水序》语，四字朱文', style: 'zhu', borderStyle: 'borrow', layoutNote: '四字均分，「观」字略收以让边', adopted: true, revision: 1, sourceDesignId: null, supersededByDesignId: null, certifiedAt: now - day * 40, createdAt: now - day * 70, updatedAt: now - day * 40 },
+    { id: 'design_0102', stoneId: 'stone_01', sealText: '澄怀', annotation: '取前稿二字，作小印', style: 'bai', borderStyle: 'none', layoutNote: '二字上下排布，留大片红', adopted: false, revision: 1, sourceDesignId: null, supersededByDesignId: null, certifiedAt: null, createdAt: now - day * 60, updatedAt: now - day * 55 },
+    { id: 'design_0201', stoneId: 'stone_02', sealText: '日新其德', annotation: '《礼记·大学》语，白文', style: 'bai', borderStyle: 'double', layoutNote: '双边仿汉印，「德」字略长', adopted: true, revision: 1, sourceDesignId: null, supersededByDesignId: null, certifiedAt: now - day * 6, createdAt: now - day * 40, updatedAt: now - day * 6 },
+    { id: 'design_0301', stoneId: 'stone_03', sealText: '金石为开', annotation: '汉谚，朱文借边', style: 'zhu', borderStyle: 'borrow', layoutNote: '借边求满，四字紧凑', adopted: true, revision: 1, sourceDesignId: null, supersededByDesignId: null, certifiedAt: now - day * 100, createdAt: now - day * 120, updatedAt: now - day * 100 },
+    { id: 'design_0401', stoneId: 'stone_04', sealText: '清风徐来', annotation: '《赤壁赋》语，瓦当式', style: 'zhu', borderStyle: 'tile', layoutNote: '瓦当圆框，「来」字压缩', adopted: true, revision: 1, sourceDesignId: null, supersededByDesignId: null, certifiedAt: now - day * 2, createdAt: now - day * 20, updatedAt: now - day * 2 },
+    // 换稿再刻演示：design_0501 为已认证旧版（仍 adopted，直到新版刻完并钤印认证）；
+    // design_0502 为独立再刻版（朱白文变了）：复制工序为待办，不继承旧钤印，尚未认证。
+    { id: 'design_0501', stoneId: 'stone_05', sealText: '守拙', annotation: '陶潜「守拙归园田」，白文旧版', style: 'bai', borderStyle: 'double', layoutNote: '白文双边，二字左右分列', adopted: true, revision: 1, sourceDesignId: null, supersededByDesignId: null, certifiedAt: now - day * 80, createdAt: now - day * 100, updatedAt: now - day * 80 },
+    { id: 'design_0502', stoneId: 'stone_05', sealText: '守拙', annotation: '旧版白文易糊，改朱文借边再刻', style: 'zhu', borderStyle: 'borrow', layoutNote: '朱文细挺，借边以求完整', adopted: false, revision: 2, sourceDesignId: 'design_0501', supersededByDesignId: null, certifiedAt: null, createdAt: now - day * 4, updatedAt: now - day * 2 },
   ];
 
   const carves: Carve[] = [
@@ -223,6 +315,12 @@ export async function seedDatabase(): Promise<void> {
     { id: 'carve_030101', designId: 'design_0301', seq: 1, knifeMethod: 'chong', minutes: 45, operator: '顾墨', state: 'done', createdAt: now - day * 115, updatedAt: now - day * 112 },
     { id: 'carve_030102', designId: 'design_0301', seq: 2, knifeMethod: 'trim', minutes: 20, operator: '顾墨', state: 'done', createdAt: now - day * 112, updatedAt: now - day * 100 },
     { id: 'carve_040101', designId: 'design_0401', seq: 1, knifeMethod: 'qie', minutes: 30, operator: '林砚', state: 'doing', createdAt: now - day * 16, updatedAt: now - day * 2 },
+    // 旧版 design_0501 的已完成工序（留在印石历史）
+    { id: 'carve_050101', designId: 'design_0501', seq: 1, knifeMethod: 'chong', minutes: 40, operator: '顾墨', state: 'done', createdAt: now - day * 95, updatedAt: now - day * 90 },
+    { id: 'carve_050102', designId: 'design_0501', seq: 2, knifeMethod: 'trim', minutes: 20, operator: '顾墨', state: 'done', createdAt: now - day * 90, updatedAt: now - day * 80 },
+    // 再刻版 design_0502：复制旧工序为待办，尚未刻完
+    { id: 'carve_050201', designId: 'design_0502', seq: 1, knifeMethod: 'chong', minutes: 40, operator: '顾墨', state: 'doing', createdAt: now - day * 4, updatedAt: now - day * 2 },
+    { id: 'carve_050202', designId: 'design_0502', seq: 2, knifeMethod: 'trim', minutes: 20, operator: '顾墨', state: 'todo', createdAt: now - day * 4, updatedAt: now - day * 4 },
   ];
 
   const impressions: Impression[] = [
@@ -232,6 +330,8 @@ export async function seedDatabase(): Promise<void> {
     { id: 'impr_030101', designId: 'design_0301', inkBrand: '西泠印泥', paperType: 'lianshi', pressure: 'medium', grade: 'excellent', stampedAt: '2025-12-12', note: '旧作重钤，效果稳定', createdAt: now - day * 105, updatedAt: now - day * 105 },
     { id: 'impr_030102', designId: 'design_0301', inkBrand: '自制朱磦', paperType: 'lianshi', pressure: 'light', grade: 'waste', stampedAt: '2025-12-20', note: '印泥过干，效果不佳', createdAt: now - day * 100, updatedAt: now - day * 100 },
     { id: 'impr_040101', designId: 'design_0401', inkBrand: '西泠印泥', paperType: 'xuan', pressure: 'medium', grade: 'good', stampedAt: '2026-03-08', note: '试钤一版，待修边后再钤', createdAt: now - day * 2, updatedAt: now - day * 2 },
+    // 旧版 design_0501 的钤印留在历史；再刻版 design_0502 尚无钤印（完成并登记后才切换）
+    { id: 'impr_050101', designId: 'design_0501', inkBrand: '苏州姜思序堂', paperType: 'lianshi', pressure: 'heavy', grade: 'fair', stampedAt: '2026-01-10', note: '白文偏糊，决意换稿重刻', createdAt: now - day * 85, updatedAt: now - day * 85 },
   ];
 
   const catalogs: Catalog[] = [

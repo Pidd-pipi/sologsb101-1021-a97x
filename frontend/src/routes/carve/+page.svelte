@@ -14,6 +14,7 @@
   } from '$lib/components/common/FilterBar.svelte';
   import StatBadge from '$lib/components/common/StatBadge.svelte';
   import { progressOfDesign, useCarveProgress } from '$lib/hooks/useCarveProgress';
+  import StaleConfirm from '$lib/components/common/StaleConfirm.svelte';
   import {
     advanceCarve,
     batchUpdateCarves,
@@ -27,6 +28,8 @@
   } from '$lib/stores/carveStore';
   import { currentDesignId, designs, setCurrentDesign } from '$lib/stores/designStore';
   import { stones } from '$lib/stores/stoneStore';
+  import { impressions as impressionsAll } from '$lib/stores/impressionStore';
+  import { StaleVersionError } from '$lib/utils/db';
   import {
     CARVE_STATE_COLOR,
     CARVE_STATE_LABEL,
@@ -41,6 +44,7 @@
     type KnifeMethod,
   } from '$lib/types/carve';
   import { DESIGN_STYLE_LABEL } from '$lib/types/design';
+  import { designRevisionLabel, designVersionStatus } from '$lib/utils/design';
 
   const { progressByDesign, totals } = useCarveProgress();
   const queryValues = $derived(parseQuery(router.querystring ?? ''));
@@ -86,6 +90,39 @@
   let pendingDelete = $state<Carve | null>(null);
   let selectedIds = $state<string[]>([]);
   let dragId = $state('');
+  let staleOpen = $state(false);
+  let toast = $state('');
+
+  function showToast(text: string): void {
+    toast = text;
+    setTimeout(() => (toast = ''), 3000);
+  }
+
+  /** 再刻版在本看板的进度状态 */
+  const activeStatus = $derived(activeDesign ? designVersionStatus(activeDesign) : 'draft');
+  const activePrintCount = $derived(
+    activeDesignId ? $impressionsAll.filter((item) => item.designId === activeDesignId).length : 0,
+  );
+
+  async function safeAdvance(step: Carve): Promise<void> {
+    try {
+      await advanceCarve(step.id, step.updatedAt);
+      if (
+        activeDesign &&
+        designVersionStatus(activeDesign) === 'recarving' &&
+        progress.total > 0 &&
+        progress.done === progress.total
+      ) {
+        showToast('再刻版已全部刻完；登记第一条钤印后才会切换为现行版');
+      }
+    } catch (error) {
+      if (error instanceof StaleVersionError) {
+        staleOpen = true;
+      } else {
+        showToast(error instanceof Error ? error.message : '操作失败');
+      }
+    }
+  }
 
   function openCreate(): void {
     if (!activeDesignId) return;
@@ -175,8 +212,15 @@
         onchange={(event) => setCurrentDesign((event.currentTarget as HTMLSelectElement).value)}
       >
         {#each $designs as design (design.id)}
+          {@const st = designVersionStatus(design)}
           <option value={design.id}>
-            {design.sealText}{design.adopted ? '（采用稿）' : ''} · {DESIGN_STYLE_LABEL[design.style]}
+            {design.sealText}{design.adopted
+              ? '（现行版）'
+              : st === 'recarving'
+                ? `（再刻中·第${design.revision}版）`
+                : st === 'superseded'
+                  ? `（旧版·第${design.revision}版）`
+                  : ''} · {DESIGN_STYLE_LABEL[design.style]}
           </option>
         {/each}
       </select>
@@ -191,9 +235,33 @@
   {#if activeDesign}
     <div class="gb-panel flex flex-wrap items-center gap-3 text-sm text-ink-soft">
       <span class="text-ink">印文：{activeDesign.sealText}</span>
+      <span class="gb-tag" style="color:#b98a3c;border-color:#b98a3c66">{designRevisionLabel(activeDesign)}</span>
       <span>印石：{stoneName}</span>
       <span>{DESIGN_STYLE_LABEL[activeDesign.style]}</span>
       <span>释文：{activeDesign.annotation || '未填写'}</span>
+      {#if activeStatus === 'recarving'}
+        <span class="gb-tag" style="color:#b98a3c;border-color:#b98a3c66">再刻中</span>
+      {/if}
+    </div>
+  {/if}
+
+  {#if toast}
+    <div class="rounded-xl border border-jade/40 bg-jade/10 px-4 py-2 text-sm text-jade">{toast}</div>
+  {/if}
+
+  {#if activeDesign && activeStatus === 'recarving'}
+    <div class="rounded-xl border px-4 py-3 text-sm leading-relaxed" style="border-color:#b98a3c66;background:#b98a3c10;color:#8a5f24">
+      这是独立再刻版：工序由旧版复制为待办，旧版的工序与钤印仍留在印石历史。
+      {#if progress.total > 0 && progress.done === progress.total}
+        刻制已全部完成；待该版<strong>登记第一条钤印</strong>后，现行采用稿、印石状态、最佳效果与印谱统计才会切换过来（当前钤印 {activePrintCount} 次）。
+      {:else}
+        全部工序完成并登记钤印后才会切换为现行版，期间旧版仍是采用稿。
+      {/if}
+    </div>
+  {/if}
+  {#if activeDesign && activeStatus === 'superseded'}
+    <div class="rounded-xl border border-line bg-black/[0.02] px-4 py-3 text-sm text-ink-soft">
+      这是已被替代的旧版，工序记录仅作印石历史留存；再刻进度请到新版查看。
     </div>
   {/if}
 
@@ -258,7 +326,7 @@
           <div class="ml-auto flex flex-wrap gap-1">
             <button class="gb-btn" onclick={() => void move(step, -1)} title="上移">↑</button>
             <button class="gb-btn" onclick={() => void move(step, 1)} title="下移">↓</button>
-            <button class="gb-btn" onclick={() => void advanceCarve(step.id)}>推进状态</button>
+            <button class="gb-btn" onclick={() => void safeAdvance(step)}>推进状态</button>
             <button class="gb-btn" onclick={() => openEdit(step)}>编辑</button>
             <button class="gb-btn-danger" onclick={() => (pendingDelete = step)}>删除</button>
           </div>
@@ -268,9 +336,19 @@
   {/if}
 
   <p class="text-xs text-ink-soft">
-    状态推进顺序：未开始 → 进行中 → 已完成；某印稿全部工序完成时，会把所属印石状态回写为「已刻」。
+    状态推进顺序：未开始 → 进行中 → 已完成。普通稿全部完成时回写印石为「已刻」；再刻版全部完成只代表刻制结束，登记第一条钤印完成认证后才切换采用稿与印石状态。
   </p>
 </div>
+
+{#if staleOpen}
+  <StaleConfirm
+    message="这道工序或其印稿刚在另一标签页被修改"
+    onReload={() => {
+      /* store 已通过跨标签页通知自动刷新，此处仅关闭 */
+    }}
+    onCancel={() => (staleOpen = false)}
+  />
+{/if}
 
 {#if dialogOpen}
   <div class="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4">

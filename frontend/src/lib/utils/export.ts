@@ -83,7 +83,13 @@ export function buildCatalogText(context: SealCatalogContext): string {
       .filter((impression) => impression.designId === catalog.designId)
       .sort((a, b) => b.stampedAt.localeCompare(a.stampedAt));
     const best = [...prints].sort((a, b) => gradeWeight(b.grade) - gradeWeight(a.grade))[0];
-    lines.push(`第 ${catalog.orderNo} 方　${INCLUDED_LABEL[catalog.included]}`);
+    const revisionText = design
+      ? design.revision > 1
+        ? `第 ${design.revision} 版`
+        : '初版'
+      : '';
+    const historyTag = design?.supersededByDesignId ? '（旧版 · 印石历史留存）' : design?.adopted ? '（现行版）' : '';
+    lines.push(`第 ${catalog.orderNo} 方　${INCLUDED_LABEL[catalog.included]}　${revisionText}${historyTag}`);
     lines.push(
       `　印文：${design?.sealText ?? '（印稿已删除）'}　释文：${design?.annotation ?? '无'}`,
     );

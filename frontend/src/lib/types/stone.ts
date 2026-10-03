@@ -108,14 +108,18 @@ export function createEmptyStoneDraft(): StoneDraft {
 /** 印石台账的派生统计（已刻方数、闲置天数、最近钤印日期） */
 export interface StoneStat {
   stoneId: string;
-  /** 该石已刻方数（已采用稿且工序完成的印稿数） */
+  /** 该石已刻方数（现行采用版已认证：工序全部完成且已登记钤印） */
   carvedCount: number;
   /** 印稿总数 */
   designCount: number;
+  /** 印石历史中的版本数（含初版与各次再刻版） */
+  revisionCount: number;
+  /** 当前采用版版次（无采用稿为 0） */
+  currentRevision: number;
   /** 闲置天数（未产生印稿的时间） */
   idleDays: number;
-  /** 最近钤印日期 */
+  /** 最近钤印日期（现行采用版） */
   lastStampedAt: string;
-  /** 印谱收录方数 */
+  /** 印谱收录方数（仅统计现行采用版对应的条目） */
   catalogIncluded: number;
 }

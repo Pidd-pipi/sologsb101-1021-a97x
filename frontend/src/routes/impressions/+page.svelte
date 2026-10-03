@@ -14,6 +14,7 @@
   } from '$lib/components/common/FilterBar.svelte';
   import GradeTag from '$lib/components/common/GradeTag.svelte';
   import StatBadge from '$lib/components/common/StatBadge.svelte';
+  import StaleConfirm from '$lib/components/common/StaleConfirm.svelte';
   import {
     applyBestAsAdopted,
     bestImpressionOf,
@@ -21,6 +22,7 @@
     filteredImpressions,
     impressionFilters,
     impressionsOfDesign,
+    loadImpressions,
     removeImpression,
     resetImpressionFilters,
     setImpressionGrades,
@@ -28,7 +30,9 @@
     setImpressionPaperTypes,
     updateImpression,
   } from '$lib/stores/impressionStore';
-  import { currentDesignId, designs, setCurrentDesign } from '$lib/stores/designStore';
+  import { currentDesignId, designs, loadDesigns, setCurrentDesign } from '$lib/stores/designStore';
+  import { loadCarves } from '$lib/stores/carveStore';
+  import { StaleVersionError } from '$lib/utils/db';
   import {
     GRADE_COLOR,
     GRADE_LABEL,
@@ -46,6 +50,7 @@
     type PaperKind,
   } from '$lib/types/impression';
   import { DESIGN_STYLE_LABEL } from '$lib/types/design';
+  import { designRevisionLabel, designVersionStatus } from '$lib/utils/design';
 
   const queryValues = $derived(parseQuery(router.querystring ?? ''));
 
@@ -58,6 +63,7 @@
   const activeDesignId = $derived($currentDesignId ?? $designs[0]?.id ?? '');
   const activeDesign = $derived($designs.find((design) => design.id === activeDesignId) ?? null);
   const list = $derived(impressionsOfDesign(activeDesignId));
+  const activeStatus = $derived(activeDesign ? designVersionStatus(activeDesign) : 'draft');
 
   const totals = $derived({
     total: $filteredImpressions.length,
@@ -83,19 +89,25 @@
 
   let dialogOpen = $state(false);
   let editing = $state<Impression | null>(null);
+  let editVersionAt = 0;
+  let designVersionAt = 0;
   let draft = $state<ImpressionDraft>(createEmptyImpressionDraft(''));
   let pendingDelete = $state<Impression | null>(null);
   let toast = $state('');
+  let staleOpen = $state(false);
 
   function openCreate(): void {
-    if (!activeDesignId) return;
+    if (!activeDesignId || !activeDesign) return;
     editing = null;
+    designVersionAt = activeDesign.updatedAt;
     draft = createEmptyImpressionDraft(activeDesignId);
     dialogOpen = true;
   }
 
   function openEdit(impression: Impression): void {
     editing = impression;
+    editVersionAt = impression.updatedAt;
+    designVersionAt = activeDesign?.updatedAt ?? 0;
     draft = {
       designId: impression.designId,
       inkBrand: impression.inkBrand,
@@ -109,13 +121,25 @@
   }
 
   async function submit(): Promise<void> {
-    if (editing) {
-      await updateImpression(editing.id, { ...draft });
-      editing = null;
-    } else {
-      await createImpression({ ...draft });
+    try {
+      if (editing) {
+        await updateImpression(editing.id, { ...draft }, editVersionAt);
+      } else {
+        const result = await createImpression({ ...draft }, designVersionAt);
+        if (result.certified) {
+          toast = '再刻版已完成认证：现行采用稿、印石状态、最佳效果与印谱统计已切换到新版';
+        }
+      }
+      dialogOpen = false;
+    } catch (error) {
+      if (error instanceof StaleVersionError) {
+        staleOpen = true;
+        dialogOpen = false;
+      } else {
+        toast = error instanceof Error ? error.message : '保存失败';
+        setTimeout(() => (toast = ''), 2600);
+      }
     }
-    dialogOpen = false;
   }
 
   async function confirmDelete(): Promise<void> {
@@ -125,11 +149,19 @@
   }
 
   async function adoptBest(): Promise<void> {
-    const best = await applyBestAsAdopted(activeDesignId);
-    toast = best
-      ? `已把 ${best.stampedAt} 的「${GRADE_LABEL[best.grade]}」效果回填为采用稿效果`
-      : '该印稿还没有钤印记录';
-    setTimeout(() => (toast = ''), 2600);
+    try {
+      const best = await applyBestAsAdopted(activeDesignId);
+      toast = best
+        ? `已把 ${best.stampedAt} 的「${GRADE_LABEL[best.grade]}」效果回填为采用稿效果`
+        : '该印稿还没有钤印记录';
+    } catch (error) {
+      toast = error instanceof Error ? error.message : '操作失败';
+    }
+    setTimeout(() => (toast = ''), 3000);
+  }
+
+  async function reloadAll(): Promise<void> {
+    await Promise.all([loadDesigns(), loadCarves(), loadImpressions()]);
   }
 </script>
 
@@ -146,7 +178,16 @@
         onchange={(event) => setCurrentDesign((event.currentTarget as HTMLSelectElement).value)}
       >
         {#each $designs as design (design.id)}
-          <option value={design.id}>{design.sealText} · {DESIGN_STYLE_LABEL[design.style]}</option>
+          {@const st = designVersionStatus(design)}
+          <option value={design.id}>
+            {design.sealText}{design.adopted
+              ? '（现行版）'
+              : st === 'recarving'
+                ? `（再刻中·第${design.revision}版）`
+                : st === 'superseded'
+                  ? `（旧版·第${design.revision}版）`
+                  : ''} · {DESIGN_STYLE_LABEL[design.style]}
+          </option>
         {/each}
       </select>
       <button class="gb-btn" disabled={list.length === 0} onclick={() => void adoptBest()}>回填采用稿效果</button>
@@ -161,14 +202,31 @@
   {#if activeDesign}
     <div class="gb-panel flex flex-wrap items-center gap-3 text-sm text-ink-soft">
       <span class="text-ink">印文：{activeDesign.sealText}</span>
+      <span class="gb-tag" style="color:#b98a3c;border-color:#b98a3c66">{designRevisionLabel(activeDesign)}</span>
       <span>释文：{activeDesign.annotation || '未填写'}</span>
-      <span>{activeDesign.adopted ? '已采用' : '未采用'}</span>
+      <span>{activeDesign.adopted ? '现行采用版' : activeStatus === 'recarving' ? '再刻中（旧版仍现行）' : '未采用'}</span>
       {#if bestImpressionOf(activeDesignId)}
         {@const best = bestImpressionOf(activeDesignId)}
         {#if best}
           <GradeTag grade={best.grade} size="small" note={`当前最佳 ${best.stampedAt}`} />
         {/if}
       {/if}
+    </div>
+  {/if}
+
+  {#if activeDesign && activeStatus === 'recarving'}
+    <div class="rounded-xl border px-4 py-3 text-sm leading-relaxed" style="border-color:#b98a3c66;background:#b98a3c10;color:#8a5f24">
+      这是独立再刻版，旧版钤印不会带过来。在此登记的钤印只属于新版；
+      {#if list.length === 0}
+        当新版工序已全部完成时，登记<strong>第一条钤印即完成认证</strong>，现行采用稿、印石状态、最佳效果与印谱统计随即切换过来。
+      {:else}
+        若新版工序已全部完成，最新登记会触发认证切换；否则保持在刻，旧版仍为现行版。
+      {/if}
+    </div>
+  {/if}
+  {#if activeDesign && activeStatus === 'superseded'}
+    <div class="rounded-xl border border-line bg-black/[0.02] px-4 py-3 text-sm text-ink-soft">
+      这是已被替代旧版的钤印历史，仅留存档案，不再参与现行版最佳效果与印谱统计。
     </div>
   {/if}
 
@@ -233,9 +291,17 @@
   {/if}
 
   <p class="text-xs text-ink-soft">
-    评级排序：优 &gt; 良 &gt; 一般 &gt; 废；「回填采用稿效果」会把当前稿评级最高的一条标记为采用效果，并把印稿置为采用稿。
+    评级排序：优 &gt; 良 &gt; 一般 &gt; 废；再刻版登记钤印不继承旧版。再刻版工序全部完成后，第一条钤印登记即完成认证，采用稿、印石状态、最佳效果与印谱统计才切到新版；另一标签页若改过采用稿，请按提示重新确认后再登记。
   </p>
 </div>
+
+{#if staleOpen}
+  <StaleConfirm
+    message="该印稿（采用稿）刚在另一标签页被修改或被补记钤印"
+    onReload={reloadAll}
+    onCancel={() => (staleOpen = false)}
+  />
+{/if}
 
 {#if dialogOpen}
   <div class="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4">

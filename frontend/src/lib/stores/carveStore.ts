@@ -1,9 +1,13 @@
 /**
  * 刻制工序 store（Svelte writable / derived）
- * 维护工序顺序与完成计数；全部完成即回写印稿为已刻（印石状态置为「已刻」）。
+ * 维护工序顺序与完成计数。
+ * - 普通采用稿：全部工序完成回写印石为「已刻」；
+ * - 再刻版：全部完成仅表示刻制结束，印石仍保持「在刻」，
+ *   待登记第一条钤印并通过认证后，才切换采用稿与印石状态（见 designStore.certifyRecarvedDesign）。
  */
 import { derived, get, writable } from 'svelte/store';
-import { createId, db } from '$lib/utils/db';
+import { createId, db, StaleVersionError, updateIfCurrent } from '$lib/utils/db';
+import { subscribeCrudChanges } from '$lib/utils/crud-events';
 import {
   nextCarveState,
   suggestMinutes,
@@ -13,8 +17,9 @@ import {
   type CarveState,
   type KnifeMethod,
 } from '$lib/types/carve';
-import { designById, updateDesign } from './designStore';
+import { certifyRecarvedDesign } from './designStore';
 import { updateStone } from './stoneStore';
+import { isRecarvedDesign } from '$lib/utils/design';
 
 export const carves = writable<Carve[]>([]);
 export const carveLoading = writable(false);
@@ -109,29 +114,45 @@ export async function batchUpdateCarves(ids: string[], patch: Partial<Carve>): P
     .map((carve) => ({ ...carve, ...patch, updatedAt: now }));
   await db.carves.bulkPut(rows);
   await loadCarves();
+  // 若批量完成把某再刻版的最后工序收掉，则尝试认证（仍需该版已登记钤印才会切换）
+  const designIds = Array.from(new Set(rows.map((row) => row.designId)));
+  await Promise.all(designIds.map((designId) => settleDesignAfterCarve(designId)));
 }
 
 /**
- * 推进工序状态；某印稿全部工序完成时回写印石状态为「已刻」。
+ * 工序变化后收敛印稿状态：
+ * - 再刻版：满足「工序完成 + 已有钤印」则认证切换；否则保持在刻，不回写已刻；
+ * - 普通稿：全部工序完成沿用原行为，回写印石为「已刻」。
+ */
+async function settleDesignAfterCarve(designId: string): Promise<void> {
+  const fresh = await db.designs.get(designId);
+  if (!fresh) return;
+  const steps = await db.carves.where('designId').equals(designId).toArray();
+  const allDone = steps.length > 0 && steps.every((step) => step.state === 'done');
+  if (!allDone) return;
+  if (isRecarvedDesign(fresh)) {
+    await certifyRecarvedDesign(designId);
+    return;
+  }
+  await updateStone(fresh.stoneId, { state: 'carved' });
+}
+
+/**
+ * 推进工序状态；某印稿全部工序完成时按版本规则收敛印石状态。
+ * expectedUpdatedAt 非空时校验页面持有的工序版本（另一标签页改过则要求重新确认）。
  * 返回推进后的状态，便于页面提示。
  */
-export async function advanceCarve(id: string): Promise<CarveState> {
-  const carve = get(carves).find((item) => item.id === id);
-  if (!carve) return 'todo';
+export async function advanceCarve(id: string, expectedUpdatedAt?: number): Promise<CarveState> {
+  const carve = await db.carves.get(id);
+  if (!carve) throw new StaleVersionError('carves', id);
+  if (expectedUpdatedAt !== undefined && carve.updatedAt !== expectedUpdatedAt) {
+    throw new StaleVersionError('carves', id);
+  }
   const next = nextCarveState(carve.state);
   if (next === carve.state) return carve.state;
-  await updateCarve(id, { state: next });
-
-  const designId = carve.designId;
-  const steps = carvesOfDesign(designId);
-  const allDone = steps.length > 0 && steps.every((step) => step.state === 'done');
-  if (allDone) {
-    const design = designById(designId);
-    if (design) {
-      await updateDesign(designId, {});
-      await updateStone(design.stoneId, { state: 'carved' });
-    }
-  }
+  await updateIfCurrent(db.carves, id, { state: next }, expectedUpdatedAt);
+  await loadCarves();
+  await settleDesignAfterCarve(carve.designId);
   return next;
 }
 
@@ -159,4 +180,11 @@ export async function generateStandardSequence(designId: string): Promise<number
   }
   await loadCarves();
   return created;
+}
+
+// 其它标签页改动工序或认证采用稿（designs）时，本标签页重新载入看板
+if (typeof window !== 'undefined') {
+  subscribeCrudChanges((table) => {
+    if (table === 'carves' || table === 'designs') void loadCarves();
+  });
 }

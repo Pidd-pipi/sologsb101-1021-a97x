@@ -82,12 +82,22 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Stone 印石 | `src/lib/types/stone.ts` | `id` `name` `stoneType`（寿山/青田/昌化/巴林） `sizeMm`（长×宽×高） `knobStyle`（平顶/桥钮/古兽/薄意） `purchaseDate` `state`（在刻/已刻/闲置） | 新建后进入印稿设计，卡片回显已刻方数与最近钤印日期 |
-| Design 印稿 | `src/lib/types/design.ts` | `id` `stoneId` `sealText` `annotation` `style`（朱文/白文） `borderStyle`（无框/双边/借边/瓦当） `layoutNote` `adopted` | 同石多稿，采用稿唯一，采用后带出到刻制与钤印 |
+| Design 印稿 | `src/lib/types/design.ts` | `id` `stoneId` `sealText` `annotation` `style`（朱文/白文） `borderStyle`（无框/双边/借边/瓦当） `layoutNote` `adopted` `revision` `sourceDesignId` `supersededByDesignId` `certifiedAt` | 同石多稿，采用稿唯一；**换稿再刻**建立独立新版（旧稿与旧工序/钤印/印谱留存历史，新稿复制工序为待办、不继承钤印，刻完并登记钤印认证后才切换） |
 | Carve 刻制工序 | `src/lib/types/carve.ts` | `id` `designId` `seq` `knifeMethod`（冲刀/切刀/双刀/修整） `minutes` `operator` `state`（未开始/进行中/已完成） | 拖拽调序，全部完成即回写印石为已刻 |
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
 | Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
+数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v3`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）；`v3` 为换稿再刻引入版本链字段 `designs.revision`（版次，初版 1）、`sourceDesignId`（再刻版来源稿）、`supersededByDesignId`（旧版被哪一版替代）、`certifiedAt`（完成刻制并登记钤印的认证时间），升级时历史稿一律视为已认证初版，升级前后统计保持一致。
+
+### 换稿再刻（独立版本）规则
+
+一方印石刻完后常会换稿再刻，**印文、朱白文或边框变了就是一方新印**，不能直接改采用稿，否则会把旧工序与旧钤印算进新印：
+
+1. **建独立再刻版**：在印稿页对有刻制/钤印历史的稿件点「换稿再刻」，或在编辑框里改动印文/朱白文/边框后按提示建版（直接改这些关键字段会被拒绝，释文、章法备注等仍可直接改）。
+2. **历史留存**：旧稿取消采用并标记被替代，旧工序、旧钤印与旧印谱条目原样留在印石历史里；旧版在卡片与印谱中以「旧版·第 n 版」灰显。
+3. **只复制工序为待办**：新稿按旧工序逐条复制并全部重置为「未开始」，**不继承旧钤印**，新稿先不采用、印石回到「在刻」。
+4. **完成并登记钤印后才切换**：新稿全部工序完成只代表刻制结束；待该版登记第一条钤印时自动「认证」——切换采用稿、印石置为「已刻」、印谱末尾补一条该版「待收录」条目。此后印石状态、最佳钤印效果、已刻方数与印谱收录统计才切到新版。
+5. **多标签页并发**：另一标签页若同时改了采用稿或补了钤印，本页会经 BroadcastChannel 自动重新载入使旧页面版本失效；保存/登记动作以打开弹窗时的 `updatedAt` 做乐观并发校验，过期时弹出「保存前重新确认」，重新载入最新数据后再决定是否写入。
 
 ---
 
@@ -100,9 +110,9 @@ sologsb101-1021/
 │   │   ├── lib/
 │   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts
 │   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts
-│   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
+│   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte StaleConfirm.svelte
 │   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts
-│   │   │   ├── utils/            # stone.ts db.ts export.ts
+│   │   │   ├── utils/            # stone.ts design.ts db.ts crud-events.ts export.ts
 │   │   │   └── router/           # index.ts（路由表 + 导航项）
 │   │   ├── routes/               # stones/+page.svelte designs/+page.svelte carve/+page.svelte
 │   │   │                         # impressions/+page.svelte catalog/+page.svelte NotFound.svelte

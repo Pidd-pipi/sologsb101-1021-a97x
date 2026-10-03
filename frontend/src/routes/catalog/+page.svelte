@@ -26,6 +26,7 @@
     importSnapshot,
     readLastBackupAt,
     resetDatabase,
+    StaleVersionError,
     writeLastBackupAt,
   } from '$lib/utils/db';
   import {
@@ -86,7 +87,10 @@
 
   function designText(designId: string): string {
     const design = $designs.find((item) => item.id === designId);
-    return design ? `${design.sealText}（${design.annotation || '无释文'}）` : '（印稿已删除）';
+    if (!design) return '（印稿已删除）';
+    const rev = design.revision > 1 ? ` · 第${design.revision}版` : ' · 初版';
+    const superseded = design.supersededByDesignId ? ' · 旧版' : design.adopted ? ' · 现行版' : '';
+    return `${design.sealText}${rev}${superseded}（${design.annotation || '无释文'}）`;
   }
 
   function stoneText(stoneId: string): string {
@@ -112,11 +116,29 @@
   }
 
   async function setIncluded(entry: Catalog, included: IncludedStatus): Promise<void> {
-    await catalogTable.update(entry.id, { included });
+    try {
+      await catalogTable.updateIfCurrent(entry.id, { included }, entry.updatedAt);
+    } catch (error) {
+      if (error instanceof StaleVersionError) {
+        await catalogTable.refresh();
+        showToast('该条目刚在另一标签页被修改，已为你重新载入，请再次操作');
+      } else {
+        showToast(error instanceof Error ? error.message : '保存失败');
+      }
+    }
   }
 
   async function saveNote(entry: Catalog, note: string): Promise<void> {
-    await catalogTable.update(entry.id, { note });
+    try {
+      await catalogTable.updateIfCurrent(entry.id, { note }, entry.updatedAt);
+    } catch (error) {
+      if (error instanceof StaleVersionError) {
+        await catalogTable.refresh();
+        showToast('该条目刚在另一标签页被修改，已为你重新载入，备注未保存');
+      } else {
+        showToast(error instanceof Error ? error.message : '保存失败');
+      }
+    }
   }
 
   async function confirmDelete(): Promise<void> {
@@ -252,7 +274,9 @@
         <tbody>
           {#each ordered as entry, index (entry.id)}
             {@const best = bestImpressionOf(entry.designId)}
-            <tr>
+            {@const entryDesign = $designs.find((item) => item.id === entry.designId)}
+            {@const isOldVersion = entryDesign?.supersededByDesignId != null}
+            <tr class={isOldVersion ? 'opacity-60' : ''}>
               <td class="whitespace-nowrap">
                 <div class="flex items-center gap-1">
                   <span class="tabular-nums">{entry.orderNo}</span>
@@ -266,7 +290,12 @@
                   </button>
                 </div>
               </td>
-              <td>{designText(entry.designId)}</td>
+              <td>
+                {designText(entry.designId)}
+                {#if isOldVersion}
+                  <div class="mt-0.5 text-xs text-ink-soft">旧版条目：留存在印谱历史中，不计入现行版收录统计</div>
+                {/if}
+              </td>
               <td>{stoneText(entry.stoneId)}</td>
               <td>
                 <select

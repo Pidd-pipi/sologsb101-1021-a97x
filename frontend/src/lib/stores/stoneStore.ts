@@ -4,6 +4,7 @@
  */
 import { derived, get, writable } from 'svelte/store';
 import { createId, db, readUiPrefs, removeStoneCascade, writeUiPrefs } from '$lib/utils/db';
+import { subscribeCrudChanges } from '$lib/utils/crud-events';
 import {
   nextStoneState,
   type KnobStyle,
@@ -124,4 +125,11 @@ export async function advanceStoneState(id: string): Promise<void> {
 
 export function stoneById(id: string): Stone | undefined {
   return get(stones).find((stone) => stone.id === id);
+}
+
+// 其它标签页改了印石表时，本标签页自动重新载入，使页面上的旧版本失效
+if (typeof window !== 'undefined') {
+  subscribeCrudChanges((table) => {
+    if (table === 'stones') void loadStones();
+  });
 }

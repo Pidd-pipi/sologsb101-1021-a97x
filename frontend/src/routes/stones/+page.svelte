@@ -143,9 +143,10 @@
   }
 
   function bestGradeOf(stoneId: string): Grade | null {
-    const stoneDesigns = designsOfStone(stoneId);
-    const designIds = stoneDesigns.map((design) => design.id);
-    const prints = $impressions.filter((impression) => designIds.includes(impression.designId));
+    // 最佳效果只取现行采用版；旧版钤印留在历史，不代表这方印石的当前效果
+    const active = designsOfStone(stoneId).find((design) => design.adopted);
+    if (!active) return null;
+    const prints = $impressions.filter((impression) => impression.designId === active.id);
     if (prints.length === 0) return null;
     return [...prints].sort((a, b) => GRADE_WEIGHT[b.grade] - GRADE_WEIGHT[a.grade])[0]?.grade ?? null;
   }
@@ -228,10 +229,10 @@
             <div>钮式：{KNOB_STYLE_LABEL[stone.knobStyle]} · 购入 {stone.purchaseDate || '未记'}</div>
             <div>{describeSize(stone.sizeMm)}（印面 {sealFaceAreaCm2(stone.sizeMm)} cm²）</div>
             <div>
-              已刻 <strong class="text-ink">{stat?.carvedCount ?? 0}</strong> 方 · 印稿 {stat?.designCount ?? 0} 稿 · 谱录
-              {stat?.catalogIncluded ?? 0} 方
+              已刻 <strong class="text-ink">{stat?.carvedCount ?? 0}</strong> 方 · 印稿 {stat?.designCount ?? 0} 稿
+              （共 {stat?.revisionCount ?? 0} 版{stat?.currentRevision ? ` · 现行第 ${stat.currentRevision} 版` : ''}）
             </div>
-            <div>闲置 {stat?.idleDays ?? 0} 天 · 最近钤印 {stat?.lastStampedAt || '暂无'}</div>
+            <div>谱录 {stat?.catalogIncluded ?? 0} 方 · 闲置 {stat?.idleDays ?? 0} 天 · 最近钤印 {stat?.lastStampedAt || '暂无'}</div>
           </dl>
 
           <div class="mt-3 flex flex-wrap items-center gap-2">
@@ -255,7 +256,7 @@
   {/if}
 
   <p class="text-xs text-ink-soft">
-    提示：印石状态按「在刻 → 已刻 → 闲置」推进；已刻方数按「采用稿 + 工序全部完成」统计，工序完成时自动回写。
+    提示：印石状态按「在刻 → 已刻 → 闲置」推进。已刻方数按「现行采用版已认证（工序全部完成且已登记钤印）」统计；换稿再刻期间旧版仍现行，新版刻完并钤印后印石状态、最佳效果与印谱统计才切到新版。
   </p>
 </div>
 

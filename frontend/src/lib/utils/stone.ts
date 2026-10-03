@@ -98,7 +98,7 @@ export function stoneStateLabel(state: StoneState): string {
   return STONE_STATE_LABEL[state];
 }
 
-/** 印石维度统计：已刻方数、闲置天数、最近钤印日期、印谱收录方数 */
+/** 印石维度统计：已刻方数、闲置天数、最近钤印日期、印谱收录方数（换稿再刻按版本链统计） */
 export function buildStoneStats(
   stones: Stone[],
   designs: Design[],
@@ -107,30 +107,53 @@ export function buildStoneStats(
   catalogs: Catalog[],
 ): Record<string, StoneStat> {
   const result: Record<string, StoneStat> = {};
+
   stones.forEach((stone) => {
     const stoneDesigns = designs.filter((design) => design.stoneId === stone.id);
-    const designIds = stoneDesigns.map((design) => design.id);
-    const stoneCarves = carves.filter((carve) => designIds.includes(carve.designId));
-    const stoneImpressions = impressions
-      .filter((impression) => designIds.includes(impression.designId))
-      .sort((a, b) => a.stampedAt.localeCompare(b.stampedAt));
-    const carvedCount = stoneDesigns.filter((design) => {
-      const steps = stoneCarves.filter((carve) => carve.designId === design.id);
-      return design.adopted && steps.length > 0 && steps.every((step) => step.state === 'done');
-    }).length;
-    const lastActivityAt = Math.max(
-      ...stoneDesigns.map((design) => design.updatedAt),
-      0,
-    );
+    const designIds = new Set(stoneDesigns.map((design) => design.id));
+    const stoneCarves = carves.filter((carve) => designIds.has(carve.designId));
+    const stoneImpressions = impressions.filter((impression) => designIds.has(impression.designId));
+
+    // 现行采用版（同石唯一；再刻版认证后才切换过来）
+    const active = stoneDesigns.find((design) => design.adopted) ?? null;
+    // 版本数：初版与各次再刻版都留在印石历史中
+    const revisionCount = stoneDesigns.length;
+
+    // 已刻方数：现行采用版已认证（工序全部完成 + 已登记钤印）。一方印石同时只有一方现行印。
+    const activeSteps = active
+      ? stoneCarves.filter((carve) => carve.designId === active.id)
+      : [];
+    const activePrints = active
+      ? stoneImpressions.filter((impression) => impression.designId === active.id)
+      : [];
+    const carvedCount =
+      active && activeSteps.length > 0 && activeSteps.every((step) => step.state === 'done') && activePrints.length > 0
+        ? 1
+        : 0;
+
+    // 最近钤印只看现行采用版；旧版钤印留在历史，不影响现行版效果
+    const activeLastStamped = activePrints
+      .map((impression) => impression.stampedAt)
+      .sort((a, b) => a.localeCompare(b));
+    const lastStampedAt = activeLastStamped[activeLastStamped.length - 1] ?? '';
+
+    // 印谱收录方数：仅统计现行采用版对应条目（旧版条目保留在印谱但计入历史）
+    const catalogIncluded = active
+      ? catalogs.filter(
+          (catalog) => catalog.designId === active.id && catalog.included === 'included',
+        ).length
+      : 0;
+
+    const lastActivityAt = Math.max(...stoneDesigns.map((design) => design.updatedAt), 0);
     result[stone.id] = {
       stoneId: stone.id,
       carvedCount,
       designCount: stoneDesigns.length,
+      revisionCount,
+      currentRevision: active?.revision ?? 0,
       idleDays: idleDays(stone, lastActivityAt),
-      lastStampedAt: stoneImpressions[stoneImpressions.length - 1]?.stampedAt ?? '',
-      catalogIncluded: catalogs.filter(
-        (catalog) => catalog.stoneId === stone.id && catalog.included === 'included',
-      ).length,
+      lastStampedAt,
+      catalogIncluded,
     };
   });
   return result;

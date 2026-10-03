@@ -6,7 +6,7 @@ import { liveQuery } from 'dexie';
 import type { Table } from 'dexie';
 import { onDestroy } from 'svelte';
 import { writable, type Readable } from 'svelte/store';
-import { createId, db } from '$lib/utils/db';
+import { createId, db, updateIfCurrent } from '$lib/utils/db';
 
 export type IdbRecord = { id: string; createdAt?: number; updatedAt?: number };
 
@@ -34,6 +34,8 @@ export interface UseIdbTableResult<T extends IdbRecord> {
   list: () => Promise<T[]>;
   create: (payload: NewRecord<T>, idPrefix?: string) => Promise<T>;
   update: (id: string, patch: Partial<T>) => Promise<void>;
+  /** 乐观并发更新：expectedUpdatedAt 与当前行不一致时抛 StaleVersionError */
+  updateIfCurrent: (id: string, patch: Partial<T>, expectedUpdatedAt?: number) => Promise<void>;
   upsert: (row: T) => Promise<void>;
   remove: (id: string) => Promise<void>;
   bulkRemove: (ids: string[]) => Promise<void>;
@@ -109,6 +111,9 @@ export function useIdbTable<T extends IdbRecord>(
     },
     update: async (id, patch) => {
       await table.update(id, { ...patch, updatedAt: Date.now() } as never);
+    },
+    updateIfCurrent: async (id, patch, expectedUpdatedAt) => {
+      await updateIfCurrent(table, id, patch, expectedUpdatedAt);
     },
     upsert: async (row) => {
       await table.put({ ...row, updatedAt: Date.now() } as T);
